@@ -58,9 +58,10 @@ typings/
 .env
 
 # NPM package related
-lib/
 
 # IDEs
 .idea
 .vscode
 .DS_Store
+
+# fibi-forex fork: lib/ is committed so the engine can consume this as a git dependency

@@ -8,6 +8,7 @@ import {
   pageEvalAll,
   waitUntilElementFound,
 } from '../helpers/elements-interactions';
+import { getDebug } from '../helpers/debug';
 import { waitForNavigation } from '../helpers/navigation';
 import { getRawTransaction } from '../helpers/transactions';
 import { sleep } from '../helpers/waiting';
@@ -34,6 +35,38 @@ const NEXT_PAGE_LINK = 'a#Npage.paging';
 const CURRENT_BALANCE = '.main_balance';
 const IFRAME_NAME = 'iframe-old-pages';
 const ELEMENT_RENDER_TIMEOUT_MS = 10000;
+
+const debug = getDebug('beinleumi');
+
+// --- Foreign-currency (מט"ח) account section --------------------------------
+// FC movements are served from the same `iframe-old-pages`, on a separate portal
+// page (FC_TRANSACTIONS_URL). Only the Beinleumi (FIBI) subclass sets that URL,
+// so the pass is a no-op for any group bank that leaves it empty. The pass is
+// additionally gated on `expectedForeignCurrencyAccount` (config), which is both
+// the opt-in and a read-only guard: we never touch the top-level account
+// switcher (different switcher accounts map to different app profiles).
+const FC_CURRENCY_SELECT = 'select#IN-SCH-MTB';
+const FC_FROM_DATE_INPUT = 'input#fromDate';
+const FC_TILL_DATE_INPUT = 'input#tillDate';
+const FC_TRANSACTIONS_TABLE = 'table#dataTable040';
+const CURRENT_ACCOUNT_LABEL = 'div.current-account';
+// `#dataTable040` has fixed positional columns (some carry a class, some don't),
+// so it is parsed by index rather than by column class like the NIS tables:
+//   [0] balance  [1] value-date  [2] credit  [3] debit
+//   [4] description  [5] branch-code  [6] reference (asmachta)  [7] date
+const FC_COL = { balance: 0, credit: 2, debit: 3, description: 4, reference: 6, date: 7 } as const;
+// Map the FC currency-dropdown Hebrew label → ISO 4217. Matched by substring
+// because each label is padded and prefixed with the account/product name
+// (e.g. `106 - פמ"ח תאגידים - דולר ארה"ב`).
+const FC_CURRENCY_BY_HEBREW: ReadonlyArray<readonly [RegExp, string]> = [
+  [/דולר/, 'USD'],
+  [/אירו|יורו/, 'EUR'],
+  [/פרנק/, 'CHF'],
+  [/שטרלינג|לירה/, 'GBP'],
+  [/יין/, 'JPY'],
+  [/קנד/, 'CAD'],
+  [/אוסטרל/, 'AUD'],
+];
 
 type TransactionsColsTypes = Record<string, number>;
 type TransactionsTrTds = string[];
@@ -500,7 +533,161 @@ async function fetchAccounts(page: Page, startDate: Moment, options?: ScraperOpt
   return accounts;
 }
 
-type ScraperSpecificCredentials = { username: string; password: string };
+export function foreignCurrencyToIso(label: string): string | undefined {
+  return FC_CURRENCY_BY_HEBREW.find(([re]) => re.test(label))?.[1];
+}
+
+async function getForeignCurrencyOptions(frame: Frame): Promise<Array<{ value: string; label: string }>> {
+  return pageEvalAll<Array<{ value: string; label: string }>>(frame, `${FC_CURRENCY_SELECT} option`, [], opts =>
+    opts.map(o => ({
+      value: (o as HTMLOptionElement).value,
+      label: ((o as HTMLElement).textContent || '').trim(),
+    })),
+  );
+}
+
+async function getForeignCurrencyRows(frame: Frame): Promise<TransactionsTrTds[]> {
+  return pageEvalAll<TransactionsTrTds[]>(frame, `${FC_TRANSACTIONS_TABLE} tbody tr`, [], trs =>
+    trs.map(tr => Array.from(tr.getElementsByTagName('td')).map(td => (td as HTMLElement).innerText)),
+  );
+}
+
+export function extractForeignCurrencyTransactions(rows: TransactionsTrTds[]): ScrapedTransaction[] {
+  const txns: ScrapedTransaction[] = [];
+  for (const tds of rows) {
+    const date = (tds[FC_COL.date] || '').trim();
+    // An empty date cell is the opening-balance (יתרת פתיחה) row — skip it, same
+    // as the NIS parser drops rows without a date.
+    if (date === '') continue;
+    txns.push({
+      status: TransactionStatuses.Completed,
+      date,
+      description: (tds[FC_COL.description] || '').trim(),
+      reference: (tds[FC_COL.reference] || '').trim(),
+      debit: (tds[FC_COL.debit] || '').trim(),
+      credit: (tds[FC_COL.credit] || '').trim(),
+    });
+  }
+  return txns;
+}
+
+export function extractForeignCurrencyBalance(rows: TransactionsTrTds[]): number | undefined {
+  for (let i = rows.length - 1; i >= 0; i--) {
+    const balanceStr = (rows[i][FC_COL.balance] || '').trim();
+    if (balanceStr !== '') {
+      const parsed = getAmountData(balanceStr);
+      return Number.isNaN(parsed) ? undefined : parsed;
+    }
+  }
+  return undefined;
+}
+
+export function convertForeignCurrencyTransactions(
+  txns: ScrapedTransaction[],
+  currency: string,
+  options?: ScraperOptions,
+): Transaction[] {
+  return txns.map((txn): Transaction => {
+    const convertedDate = moment(txn.date, DATE_FORMAT).toISOString();
+    const convertedAmount = getTxnAmount(txn);
+    const result: Transaction = {
+      type: TransactionTypes.Normal,
+      identifier: txn.reference ? parseInt(txn.reference, 10) : undefined,
+      date: convertedDate,
+      processedDate: convertedDate,
+      originalAmount: convertedAmount,
+      // The FC account's own currency. chargedCurrency is intentionally left
+      // unset — downstream consumers fall back to originalCurrency, and the
+      // amount is already denominated in that currency (like the Mercury scraper).
+      originalCurrency: currency,
+      chargedAmount: convertedAmount,
+      status: txn.status,
+      description: txn.description,
+      memo: txn.memo,
+    };
+
+    if (options?.includeRawTransaction) {
+      result.rawTransaction = getRawTransaction(txn);
+    }
+
+    return result;
+  });
+}
+
+async function runForeignCurrencyQuery(frame: Frame, currencyOptionValue: string, startDate: Moment) {
+  await frame.select(FC_CURRENCY_SELECT, currencyOptionValue);
+  await fillInput(frame, FC_FROM_DATE_INPUT, startDate.format(DATE_FORMAT));
+  await fillInput(frame, FC_TILL_DATE_INPUT, moment().format(DATE_FORMAT));
+  await clickButton(frame, `input[value=${SHOW_SEARCH_BY_DATES_BUTTON_VALUE}]`);
+  await waitForNavigation(frame);
+}
+
+/**
+ * Scrapes the Beinleumi foreign-currency (מט"ח) current account, one
+ * sub-account per currency in the `#IN-SCH-MTB` dropdown.
+ *
+ * The top-level account switcher is never touched — a different switcher account
+ * belongs to a different app profile. Instead we read it (`div.current-account`)
+ * and bail if it doesn't match `expectedAccount`, so a wrong login can't record
+ * FC rows against the wrong account.
+ */
+async function fetchForeignCurrencyAccounts(
+  page: Page,
+  expectedAccount: string,
+  startDate: Moment,
+  options?: ScraperOptions,
+): Promise<TransactionsAccount[]> {
+  const frame = await getTransactionsFrame(page);
+  if (!frame) {
+    debug('foreign-currency: transactions iframe not found, skipping');
+    return [];
+  }
+
+  const selectedAccount = await page
+    .$eval(CURRENT_ACCOUNT_LABEL, el => (el as HTMLElement).innerText.trim())
+    .catch(() => '');
+  if (!selectedAccount.includes(expectedAccount)) {
+    debug('foreign-currency: switcher shows "%s", expected "%s" — skipping FC pass', selectedAccount, expectedAccount);
+    return [];
+  }
+
+  const currencies = await getForeignCurrencyOptions(frame);
+  const accounts: TransactionsAccount[] = [];
+
+  for (const { value, label } of currencies) {
+    const currency = foreignCurrencyToIso(label);
+    if (!currency) {
+      debug('foreign-currency: unmapped currency label "%s" (value %s) — skipping', label, value);
+      continue;
+    }
+
+    await runForeignCurrencyQuery(frame, value, startDate);
+
+    const accountNumber = `${expectedAccount} ${currency}`;
+    if (await isNoTransactionInDateRangeError(frame)) {
+      accounts.push({ accountNumber, txns: [] });
+      continue;
+    }
+
+    const rows = await getForeignCurrencyRows(frame);
+    accounts.push({
+      accountNumber,
+      balance: extractForeignCurrencyBalance(rows),
+      txns: convertForeignCurrencyTransactions(extractForeignCurrencyTransactions(rows), currency, options),
+    });
+  }
+
+  return accounts;
+}
+
+type ScraperSpecificCredentials = {
+  username: string;
+  password: string;
+  // Config-only field (moneyman): the base account this login is expected to
+  // land on (e.g. "038-329142"). Presence opts the login into the FC pass and is
+  // verified read-only against the account switcher. Ignored by login itself.
+  expectedForeignCurrencyAccount?: string;
+};
 
 class BeinleumiGroupBaseScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> {
   BASE_URL = '';
@@ -509,7 +696,15 @@ class BeinleumiGroupBaseScraper extends BaseScraperWithBrowser<ScraperSpecificCr
 
   TRANSACTIONS_URL = '';
 
+  // Empty by default → the FC pass is skipped. Only the Beinleumi (FIBI) subclass
+  // sets this to the foreign-currency movements portal URL.
+  FC_TRANSACTIONS_URL = '';
+
+  // Captured from credentials in getLoginOptions; gates + guards the FC pass.
+  private expectedForeignCurrencyAccount?: string;
+
   getLoginOptions(credentials: ScraperSpecificCredentials) {
+    this.expectedForeignCurrencyAccount = credentials.expectedForeignCurrencyAccount;
     return {
       loginUrl: `${this.LOGIN_URL}`,
       fields: createLoginFields(credentials),
@@ -533,6 +728,20 @@ class BeinleumiGroupBaseScraper extends BaseScraperWithBrowser<ScraperSpecificCr
     await this.navigateTo(this.TRANSACTIONS_URL);
 
     const accounts = await fetchAccounts(this.page, startMoment, this.options);
+
+    // Second pass on the same login: foreign-currency (מט"ח) accounts, which live
+    // in a separate portal section the NIS flow never visits. Opt-in + guarded by
+    // `expectedForeignCurrencyAccount`; a no-op unless the subclass sets an FC URL.
+    if (this.FC_TRANSACTIONS_URL && this.expectedForeignCurrencyAccount) {
+      await this.navigateTo(this.FC_TRANSACTIONS_URL);
+      const fcAccounts = await fetchForeignCurrencyAccounts(
+        this.page,
+        this.expectedForeignCurrencyAccount,
+        startMoment,
+        this.options,
+      );
+      accounts.push(...fcAccounts);
+    }
 
     return {
       success: true,
