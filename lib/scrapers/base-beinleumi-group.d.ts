@@ -12,6 +12,15 @@ interface ScrapedTransaction {
     description: string;
     status: TransactionStatuses;
 }
+/** A `#dataTable040` row: its cell texts, plus whether it links to a SWIFT detail. */
+type FcRow = {
+    tds: TransactionsTrTds;
+    hasDetailLink: boolean;
+};
+/** An FC transaction, carrying the reference to look a beneficiary up by (transfers only). */
+type ScrapedFcTransaction = ScrapedTransaction & {
+    detailReference?: string;
+};
 export declare function getPossibleLoginResults(): PossibleLoginResults;
 export declare function createLoginFields(credentials: ScraperSpecificCredentials): {
     selector: string;
@@ -51,8 +60,8 @@ export declare function clickAccountSelectorGetAccountIds(page: Page): Promise<s
  */
 export declare function selectAccountFromDropdown(page: Page, accountLabel: string): Promise<boolean>;
 export declare function foreignCurrencyToIso(label: string): string | undefined;
-export declare function extractForeignCurrencyTransactions(rows: TransactionsTrTds[]): ScrapedTransaction[];
-export declare function extractForeignCurrencyBalance(rows: TransactionsTrTds[]): number | undefined;
+export declare function extractForeignCurrencyTransactions(rows: FcRow[]): ScrapedFcTransaction[];
+export declare function extractForeignCurrencyBalance(rows: FcRow[]): number | undefined;
 export declare function convertForeignCurrencyTransactions(txns: ScrapedTransaction[], currency: string, options?: ScraperOptions): Transaction[];
 type ScraperSpecificCredentials = {
     username: string;

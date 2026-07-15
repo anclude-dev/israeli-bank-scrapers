@@ -68,6 +68,24 @@ const FC_CURRENCY_BY_HEBREW: ReadonlyArray<readonly [RegExp, string]> = [
   [/אוסטרל/, 'AUD'],
 ];
 
+// --- FC wire-transfer beneficiary lookup ------------------------------------
+// The FC table never shows the recipient: a wire row's אסמכתא cell holds a link
+// (`javascript:call276('','009110880')`) that pops open the underlying SWIFT
+// message. call276 doesn't navigate — it builds a URL and window.open()s it — so
+// we skip the popup entirely and fetch that URL from the page context (the
+// session cookie rides along). The SWIFT view renders label rows shaped
+// `[english, value, hebrew]`; the beneficiary is the value whose Hebrew label is
+// `שם מוטב`.
+const FC_DETAIL_LINK_SELECTOR = 'a[href*="call276"]';
+const FC_DETAIL_REFERENCE_PAD = 9;
+const FC_BENEFICIARY_LABEL = 'שם מוטב';
+// Only rows that are an actual transfer get the recipient — the paired fee row
+// (עמלות מכותבים) links to the same SWIFT message but isn't paid to the beneficiary.
+const FC_TRANSFER_DESCRIPTION_MARKER = 'העברה';
+const fcDetailUrl = (paddedReference: string) =>
+  `/MatafServiceServlets/ReadMailServlet?KEY-SUGBAKA=&I-MIS-ISKA=${paddedReference}` +
+  `&SUGBAKA=276&xslKey=POP&passMispar=${paddedReference}`;
+
 type TransactionsColsTypes = Record<string, number>;
 type TransactionsTrTds = string[];
 type TransactionsTr = { innerTds: TransactionsTrTds };
@@ -81,6 +99,12 @@ interface ScrapedTransaction {
   description: string;
   status: TransactionStatuses;
 }
+
+/** A `#dataTable040` row: its cell texts, plus whether it links to a SWIFT detail. */
+type FcRow = { tds: TransactionsTrTds; hasDetailLink: boolean };
+
+/** An FC transaction, carrying the reference to look a beneficiary up by (transfers only). */
+type ScrapedFcTransaction = ScrapedTransaction & { detailReference?: string };
 
 export function getPossibleLoginResults(): PossibleLoginResults {
   const urls: PossibleLoginResults = {};
@@ -546,40 +570,108 @@ async function getForeignCurrencyOptions(frame: Frame): Promise<Array<{ value: s
   );
 }
 
-async function getForeignCurrencyRows(frame: Frame): Promise<TransactionsTrTds[]> {
-  return pageEvalAll<TransactionsTrTds[]>(frame, `${FC_TRANSACTIONS_TABLE} tbody tr`, [], trs =>
-    trs.map(tr => Array.from(tr.getElementsByTagName('td')).map(td => (td as HTMLElement).innerText)),
+async function getForeignCurrencyRows(frame: Frame): Promise<FcRow[]> {
+  return pageEvalAll<FcRow[]>(
+    frame,
+    `${FC_TRANSACTIONS_TABLE} tbody tr`,
+    [],
+    (trs, linkSelector) => {
+      return trs.map(tr => ({
+        tds: Array.from(tr.getElementsByTagName('td')).map(td => (td as HTMLElement).innerText),
+        hasDetailLink: !!tr.querySelector(linkSelector as string),
+      }));
+    },
+    FC_DETAIL_LINK_SELECTOR,
   );
 }
 
-export function extractForeignCurrencyTransactions(rows: TransactionsTrTds[]): ScrapedTransaction[] {
-  const txns: ScrapedTransaction[] = [];
-  for (const tds of rows) {
+export function extractForeignCurrencyTransactions(rows: FcRow[]): ScrapedFcTransaction[] {
+  const txns: ScrapedFcTransaction[] = [];
+  for (const { tds, hasDetailLink } of rows) {
     const date = (tds[FC_COL.date] || '').trim();
     // An empty date cell is the opening-balance (יתרת פתיחה) row — skip it, same
     // as the NIS parser drops rows without a date.
     if (date === '') continue;
+    const reference = (tds[FC_COL.reference] || '').trim();
+    const description = (tds[FC_COL.description] || '').trim();
     txns.push({
       status: TransactionStatuses.Completed,
       date,
-      description: (tds[FC_COL.description] || '').trim(),
-      reference: (tds[FC_COL.reference] || '').trim(),
+      description,
+      reference,
       debit: (tds[FC_COL.debit] || '').trim(),
       credit: (tds[FC_COL.credit] || '').trim(),
+      // Only transfers carry a recipient worth showing; the bank links the same
+      // SWIFT message from the paired fee row, which we deliberately leave alone.
+      detailReference:
+        hasDetailLink && reference !== '' && description.includes(FC_TRANSFER_DESCRIPTION_MARKER)
+          ? reference
+          : undefined,
     });
   }
   return txns;
 }
 
-export function extractForeignCurrencyBalance(rows: TransactionsTrTds[]): number | undefined {
+export function extractForeignCurrencyBalance(rows: FcRow[]): number | undefined {
   for (let i = rows.length - 1; i >= 0; i--) {
-    const balanceStr = (rows[i][FC_COL.balance] || '').trim();
+    const balanceStr = (rows[i].tds[FC_COL.balance] || '').trim();
     if (balanceStr !== '') {
       const parsed = getAmountData(balanceStr);
       return Number.isNaN(parsed) ? undefined : parsed;
     }
   }
   return undefined;
+}
+
+/**
+ * Reads the beneficiary (`שם מוטב`) off a wire transfer's SWIFT message by
+ * fetching the popup URL that `call276` would have opened, from within the
+ * authenticated page context. Returns undefined for anything that isn't a wire
+ * with a named beneficiary (e.g. a card settlement), so callers can no-op.
+ */
+async function fetchBeneficiaryName(frame: Frame, reference: string): Promise<string | undefined> {
+  const url = fcDetailUrl(reference.padStart(FC_DETAIL_REFERENCE_PAD, '0'));
+  try {
+    return await frame.evaluate(
+      async (detailUrl: string, label: string) => {
+        const res = await fetch(detailUrl, { credentials: 'include' });
+        if (!res.ok) return undefined;
+        const parsed = new DOMParser().parseFromString(await res.text(), 'text/html');
+        for (const tr of Array.from(parsed.querySelectorAll('tr'))) {
+          const cells = Array.from(tr.querySelectorAll('td')).map(td => (td.textContent || '').trim());
+          // SWIFT label rows are [english label, value, hebrew label]
+          if (cells.length === 3 && cells[2] === label) return cells[1] || undefined;
+        }
+        return undefined;
+      },
+      url,
+      FC_BENEFICIARY_LABEL,
+    );
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Prefixes each wire transfer's description with its recipient, e.g.
+ * `OMNIPAK LIMITED – העברה- יבוא שירותים`. Each reference is fetched once, since
+ * a transfer and its fee share one אסמכתא.
+ */
+async function applyBeneficiaryNames(frame: Frame, txns: ScrapedFcTransaction[]): Promise<void> {
+  const cache = new Map<string, string | undefined>();
+  for (const txn of txns) {
+    const ref = txn.detailReference;
+    if (!ref) continue;
+    if (!cache.has(ref)) {
+      const name = await fetchBeneficiaryName(frame, ref);
+      cache.set(ref, name);
+      debug('foreign-currency: reference %s → beneficiary %s', ref, name ?? '(none)');
+    }
+    const beneficiary = cache.get(ref);
+    if (beneficiary) {
+      txn.description = `${beneficiary} – ${txn.description}`;
+    }
+  }
 }
 
 export function convertForeignCurrencyTransactions(
@@ -670,10 +762,14 @@ async function fetchForeignCurrencyAccounts(
     }
 
     const rows = await getForeignCurrencyRows(frame);
+    const scraped = extractForeignCurrencyTransactions(rows);
+    // The table never shows who a wire went to — enrich transfers from their
+    // SWIFT message before converting.
+    await applyBeneficiaryNames(frame, scraped);
     accounts.push({
       accountNumber,
       balance: extractForeignCurrencyBalance(rows),
-      txns: convertForeignCurrencyTransactions(extractForeignCurrencyTransactions(rows), currency, options),
+      txns: convertForeignCurrencyTransactions(scraped, currency, options),
     });
   }
 

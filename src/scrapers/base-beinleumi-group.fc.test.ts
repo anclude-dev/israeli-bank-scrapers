@@ -7,12 +7,15 @@ import {
 
 // Rows captured verbatim from a live `#dataTable040` (Beinleumi FC / USD account).
 // Column order: [balance, value-date, credit, debit, description, branch-code, reference, date]
-const REAL_FC_ROWS: string[][] = [
-  ['373.65', '', '', '', 'יתרת פתיחה', '', '', ''], // opening balance — no date, must be skipped
-  ['', '13/07/2026', '1,000.00', '', 'רכישת מט"ח שער מוסכם', '022', '0', '13/07/2026'], // +1000
-  ['', '13/07/2026', '500.00', '', 'רכישת מט"ח שער מוסכם', '022', '0', '13/07/2026'], // +500
-  ['', '13/07/2026', '', '1,000.00', 'העברה מחשבון לחשבון', '272', '9160350', '13/07/2026'], // -1000
-  ['871.90', '13/07/2026', '', '1.75', 'עמלות מכותבים', '272', '9160350', '13/07/2026'], // -1.75
+// `hasDetailLink` mirrors the אסמכתא cell carrying a `call276` SWIFT link.
+const row = (tds: string[], hasDetailLink = false) => ({ tds, hasDetailLink });
+
+const REAL_FC_ROWS = [
+  row(['373.65', '', '', '', 'יתרת פתיחה', '', '', '']), // opening balance — no date, must be skipped
+  row(['', '13/07/2026', '1,000.00', '', 'רכישת מט"ח שער מוסכם', '022', '0', '13/07/2026']), // +1000, no link
+  row(['', '13/07/2026', '500.00', '', 'רכישת מט"ח שער מוסכם', '022', '0', '13/07/2026']), // +500, no link
+  row(['', '13/07/2026', '', '1,000.00', 'העברה מחשבון לחשבון', '272', '9160350', '13/07/2026'], true), // -1000, transfer
+  row(['871.90', '13/07/2026', '', '1.75', 'עמלות מכותבים', '272', '9160350', '13/07/2026'], true), // -1.75, paired fee
 ];
 
 describe('Beinleumi foreign-currency parsing', () => {
@@ -41,6 +44,28 @@ describe('Beinleumi foreign-currency parsing', () => {
       expect(scraped[0]).toMatchObject({ credit: '1,000.00', debit: '', description: 'רכישת מט"ח שער מוסכם' });
       expect(scraped[2]).toMatchObject({ credit: '', debit: '1,000.00', description: 'העברה מחשבון לחשבון' });
     });
+
+    it('marks only the transfer row for beneficiary lookup', () => {
+      // the transfer (linked + description contains העברה)
+      expect(scraped[2].detailReference).toBe('9160350');
+    });
+
+    it('does not mark the paired fee row, though it links to the same SWIFT message', () => {
+      expect(scraped[3].description).toBe('עמלות מכותבים');
+      expect(scraped[3].detailReference).toBeUndefined();
+    });
+
+    it('does not mark unlinked rows (FX purchases)', () => {
+      expect(scraped[0].detailReference).toBeUndefined();
+      expect(scraped[1].detailReference).toBeUndefined();
+    });
+
+    it('does not mark a linked row that is not a transfer (e.g. card settlement)', () => {
+      const [cardRow] = extractForeignCurrencyTransactions([
+        row(['', '02/06/2026', '', '44.00', 'דיינרס קלאב', '022', '44200', '02/06/2026'], true),
+      ]);
+      expect(cardRow.detailReference).toBeUndefined();
+    });
   });
 
   describe('extractForeignCurrencyBalance', () => {
@@ -50,7 +75,7 @@ describe('Beinleumi foreign-currency parsing', () => {
 
     it('returns undefined when no balance is present', () => {
       expect(
-        extractForeignCurrencyBalance([['', '13/07/2026', '5.00', '', 'x', '', '1', '13/07/2026']]),
+        extractForeignCurrencyBalance([row(['', '13/07/2026', '5.00', '', 'x', '', '1', '13/07/2026'])]),
       ).toBeUndefined();
     });
   });
@@ -73,6 +98,13 @@ describe('Beinleumi foreign-currency parsing', () => {
 
     it('parses the reference into a numeric identifier', () => {
       expect(txns[2].identifier).toBe(9160350);
+    });
+
+    it('carries an already-applied beneficiary prefix through to the description', () => {
+      const scraped = extractForeignCurrencyTransactions(REAL_FC_ROWS);
+      scraped[2].description = `ANCLUDE LLC – ${scraped[2].description}`;
+      const converted = convertForeignCurrencyTransactions(scraped, 'USD');
+      expect(converted[2].description).toBe('ANCLUDE LLC – העברה מחשבון לחשבון');
     });
   });
 });
