@@ -28,6 +28,14 @@ export interface TransactionInstallments {
      */
     total: number;
 }
+/** Read-only destination details; deliberately separate from description/memo identity fields. */
+export interface TransferDetails {
+    recipient: string;
+    bank: string;
+    branch: string;
+    account: string;
+    purpose?: string;
+}
 export interface Transaction {
     type: TransactionTypes;
     /**
@@ -48,6 +56,7 @@ export interface Transaction {
     chargedCurrency?: string;
     description: string;
     memo?: string;
+    transferDetails?: TransferDetails;
     status: TransactionStatuses;
     installments?: TransactionInstallments;
     category?: string;

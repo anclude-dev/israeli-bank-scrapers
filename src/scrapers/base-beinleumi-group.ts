@@ -15,6 +15,8 @@ import { sleep } from '../helpers/waiting';
 import { TransactionStatuses, TransactionTypes, type Transaction, type TransactionsAccount } from '../transactions';
 import { BaseScraperWithBrowser, LoginResults, type PossibleLoginResults } from './base-scraper-with-browser';
 import { type ScraperOptions } from './interface';
+import { enrichShekelTransfers, type TransferLookup } from './beinleumi-transfer-details';
+import { type TransferDetails } from '../transactions';
 
 const DATE_FORMAT = 'DD/MM/YYYY';
 const NO_TRANSACTION_IN_DATE_RANGE_TEXT = 'לא נמצאו נתונים בנושא המבוקש';
@@ -88,7 +90,7 @@ const fcDetailUrl = (paddedReference: string) =>
 
 type TransactionsColsTypes = Record<string, number>;
 type TransactionsTrTds = string[];
-type TransactionsTr = { innerTds: TransactionsTrTds };
+type TransactionsTr = { innerTds: TransactionsTrTds; transferLookup?: TransferLookup };
 
 interface ScrapedTransaction {
   reference: string;
@@ -96,6 +98,8 @@ interface ScrapedTransaction {
   credit: string;
   debit: string;
   memo?: string;
+  transferLookup?: TransferLookup;
+  transferDetails?: TransferDetails;
   description: string;
   status: TransactionStatuses;
 }
@@ -151,6 +155,7 @@ function convertTransactions(txns: ScrapedTransaction[], options?: ScraperOption
       status: txn.status,
       description: txn.description,
       memo: txn.memo,
+      ...(txn.transferDetails ? { transferDetails: txn.transferDetails } : {}),
     };
 
     if (options?.includeRawTransaction) {
@@ -201,7 +206,7 @@ function extractTransactionDetails(
   transactionsColsTypes: TransactionsColsTypes,
 ): ScrapedTransaction {
   const tds = txnRow.innerTds;
-  const item = {
+  const item: ScrapedTransaction = {
     status: transactionStatus,
     date: getTransactionDate(tds, transactionStatus, transactionsColsTypes),
     description: getTransactionDescription(tds, transactionStatus, transactionsColsTypes),
@@ -209,6 +214,10 @@ function extractTransactionDetails(
     debit: getTransactionDebit(tds, transactionsColsTypes),
     credit: getTransactionCredit(tds, transactionsColsTypes),
   };
+
+  if (transactionStatus === TransactionStatuses.Completed && item.description === 'העברה מהחשבון') {
+    item.transferLookup = txnRow.transferLookup;
+  }
 
   return item;
 }
@@ -250,9 +259,20 @@ async function extractTransactions(page: Page | Frame, tableLocator: string, tra
   const transactionsColsTypes = await getTransactionsColsTypeClasses(page, tableLocator);
 
   const transactionsRows = await pageEvalAll<TransactionsTr[]>(page, `${tableLocator} tbody tr`, [], trs => {
-    return trs.map(tr => ({
-      innerTds: Array.from(tr.getElementsByTagName('td')).map(td => td.innerText),
-    }));
+    return trs.map(tr => {
+      const link = tr.querySelector('a.PW1[sugbakasha="523"]');
+      return {
+        innerTds: Array.from(tr.getElementsByTagName('td')).map(td => td.innerText),
+        ...(link
+          ? {
+              transferLookup: {
+                date: link.getAttribute('actdate') ?? '',
+                processingStage: link.getAttribute('shlavibud') ?? '',
+              },
+            }
+          : {}),
+      };
+    });
   });
 
   for (const txnRow of transactionsRows) {
@@ -323,6 +343,10 @@ async function scrapeTransactions(
       }
     }
   } while (hasNextPage);
+
+  if (options?.additionalTransactionInformation && transactionStatus === TransactionStatuses.Completed) {
+    await enrichShekelTransfers(page, txns);
+  }
 
   return convertTransactions(txns, options);
 }

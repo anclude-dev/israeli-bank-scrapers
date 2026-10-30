@@ -2,6 +2,8 @@ import { type Page } from 'puppeteer';
 import { TransactionStatuses, type Transaction, type TransactionsAccount } from '../transactions';
 import { BaseScraperWithBrowser, type PossibleLoginResults } from './base-scraper-with-browser';
 import { type ScraperOptions } from './interface';
+import { type TransferLookup } from './beinleumi-transfer-details';
+import { type TransferDetails } from '../transactions';
 type TransactionsTrTds = string[];
 interface ScrapedTransaction {
     reference: string;
@@ -9,6 +11,8 @@ interface ScrapedTransaction {
     credit: string;
     debit: string;
     memo?: string;
+    transferLookup?: TransferLookup;
+    transferDetails?: TransferDetails;
     description: string;
     status: TransactionStatuses;
 }
